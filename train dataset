@@ -1,0 +1,222 @@
+import os
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras import layers
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import confusion_matrix, classification_report, ConfusionMatrixDisplay
+
+# -----------------------
+# Paths
+# -----------------------
+train_dir = "/kaggle/input/fer2013-2026/train"
+test_dir  = "/kaggle/input/fer2013-2026/test"
+
+# Use ONLY these 4 folders (must match folder names exactly)
+CLASS_NAMES = ["angry", "happy", "neutral", "sad"]
+
+img_size = 48
+batch_size = 64
+epochs = 80
+SEED = 42
+
+# -----------------------
+# Data generators (FIXED)
+# validation must come from TRAIN folder
+# -----------------------
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    width_shift_range=0.10,
+    height_shift_range=0.10,
+    horizontal_flip=True,
+    rotation_range=10,
+    zoom_range=0.10,
+    validation_split=0.2
+)
+
+val_datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2
+)
+
+train_generator = train_datagen.flow_from_directory(
+    directory=train_dir,
+    target_size=(img_size, img_size),
+    batch_size=batch_size,
+    color_mode="grayscale",
+    class_mode="categorical",
+    classes=CLASS_NAMES,          # ✅ force correct class order
+    subset="training",
+    shuffle=True,
+    seed=SEED
+)
+
+validation_generator = val_datagen.flow_from_directory(
+    directory=train_dir,          # ✅ FIX: use train_dir, not test_dir
+    target_size=(img_size, img_size),
+    batch_size=batch_size,
+    color_mode="grayscale",
+    class_mode="categorical",
+    classes=CLASS_NAMES,
+    subset="validation",
+    shuffle=False
+)
+
+# Separate real TEST generator (no split)
+test_generator = ImageDataGenerator(rescale=1./255).flow_from_directory(
+    directory=test_dir,
+    target_size=(img_size, img_size),
+    batch_size=batch_size,
+    color_mode="grayscale",
+    class_mode="categorical",
+    classes=CLASS_NAMES,
+    shuffle=False                 # ✅ important for confusion matrix
+)
+
+print("Class indices:", train_generator.class_indices)
+
+# -----------------------
+# Class weights (prevents 'all happy' collapse)
+# -----------------------
+y_train = train_generator.classes
+cw = compute_class_weight(class_weight="balanced", classes=np.unique(y_train), y=y_train)
+class_weight = {i: float(w) for i, w in enumerate(cw)}
+print("class_weight:", class_weight)
+
+# -----------------------
+# Your CNN (same style, tuned)
+# Output changed to 4 classes
+# -----------------------
+model = tf.keras.Sequential([
+    layers.Conv2D(32, (3,3), activation='relu', input_shape=(48,48,1)),
+    layers.Conv2D(64, (3,3), padding='same', activation='relu'),
+    layers.BatchNormalization(),
+    layers.MaxPooling2D(2,2),
+    layers.Dropout(0.25),
+
+    layers.Conv2D(128, (5,5), padding='same', activation='relu'),
+    layers.BatchNormalization(),
+    layers.MaxPooling2D(2,2),
+    layers.Dropout(0.25),
+
+    layers.Conv2D(512, (3,3), padding='same', activation='relu',
+                  kernel_regularizer=tf.keras.regularizers.l2(0.001)),  # slightly lighter than 0.01
+    layers.BatchNormalization(),
+    layers.MaxPooling2D(2,2),
+    layers.Dropout(0.30),
+
+    layers.Conv2D(512, (3,3), padding='same', activation='relu',
+                  kernel_regularizer=tf.keras.regularizers.l2(0.001)),
+    layers.BatchNormalization(),
+    layers.MaxPooling2D(2,2),
+    layers.Dropout(0.30),
+
+    layers.Flatten(),
+    layers.Dense(256, activation='relu'),
+    layers.BatchNormalization(),
+    layers.Dropout(0.35),
+
+    layers.Dense(512, activation='relu'),
+    layers.BatchNormalization(),
+    layers.Dropout(0.35),
+
+    layers.Dense(len(CLASS_NAMES), activation='softmax')  # ✅ 4 classes
+])
+
+# Better optimizer usage
+optimizer = tf.keras.optimizers.Adam(learning_rate=3e-4)
+
+model.compile(
+    optimizer=optimizer,
+    loss="categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+model.summary()
+
+# -----------------------
+# Callbacks (very important for high accuracy)
+# -----------------------
+callbacks = [
+    tf.keras.callbacks.ModelCheckpoint(
+        "best_cnn_4class.keras",
+        monitor="val_accuracy",
+        save_best_only=True,
+        verbose=1
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=3,
+        min_lr=1e-6,
+        verbose=1
+    ),
+    tf.keras.callbacks.EarlyStopping(
+        monitor="val_accuracy",
+        patience=10,
+        restore_best_weights=True,
+        verbose=1
+    )
+]
+
+# -----------------------
+# Train
+# -----------------------
+history = model.fit(
+    train_generator,
+    epochs=epochs,
+    validation_data=validation_generator,
+    class_weight=class_weight,
+    callbacks=callbacks
+)
+
+# -----------------------
+# Graphs (Accuracy + Loss)
+# -----------------------
+acc = history.history["accuracy"]
+val_acc = history.history["val_accuracy"]
+loss = history.history["loss"]
+val_loss = history.history["val_loss"]
+
+plt.figure(figsize=(7,4))
+plt.plot(acc, label="Train Acc")
+plt.plot(val_acc, label="Val Acc")
+plt.title("Accuracy")
+plt.xlabel("Epoch"); plt.ylabel("Accuracy")
+plt.legend(); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(7,4))
+plt.plot(loss, label="Train Loss")
+plt.plot(val_loss, label="Val Loss")
+plt.title("Loss")
+plt.xlabel("Epoch"); plt.ylabel("Loss")
+plt.legend(); plt.tight_layout(); plt.show()
+
+# -----------------------
+# Evaluate on TEST
+# -----------------------
+test_loss, test_acc = model.evaluate(test_generator, verbose=0)
+print(f"TEST Accuracy: {test_acc*100:.2f}% | TEST Loss: {test_loss:.4f}")
+
+# -----------------------
+# Confusion Matrix (TEST)
+# -----------------------
+test_generator.reset()
+pred_probs = model.predict(test_generator, verbose=0)
+y_pred = np.argmax(pred_probs, axis=1)
+y_true = test_generator.classes
+
+print("Unique predictions:", np.unique(y_pred, return_counts=True))
+
+cm = confusion_matrix(y_true, y_pred)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=CLASS_NAMES)
+
+plt.figure(figsize=(6,6))
+disp.plot(values_format="d")
+plt.title("Confusion Matrix (Test Set)")
+plt.tight_layout()
+plt.show()
+
+print(classification_report(y_true, y_pred, target_names=CLASS_NAMES, digits=4))
